@@ -23,6 +23,7 @@ import { Route as AuthenticatedDashboardRouteImport } from './routes/_authentica
 import { Route as SSlugRouteRouteImport } from './routes/s/$slug/route'
 import { Route as AuthenticatedAdminRouteRouteImport } from './routes/_authenticated/admin/route'
 import { Route as SSlugIndexRouteImport } from './routes/s/$slug/index'
+import { Route as ApiMeIndexRouteImport } from './routes/api/me/index'
 import { Route as AuthenticatedAdminIndexRouteImport } from './routes/_authenticated/admin/index'
 import { Route as SSlugRegisterRouteImport } from './routes/s/$slug/register'
 import { Route as SSlugLoginRouteImport } from './routes/s/$slug/login'
@@ -105,6 +106,11 @@ const SSlugIndexRoute = SSlugIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => SSlugRouteRoute,
+} as any)
+const ApiMeIndexRoute = ApiMeIndexRouteImport.update({
+  id: '/api/me/',
+  path: '/api/me/',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const AuthenticatedAdminIndexRoute = AuthenticatedAdminIndexRouteImport.update({
   id: '/',
@@ -199,6 +205,7 @@ export interface FileRoutesByFullPath {
   '/s/$slug/login': typeof SSlugLoginRoute
   '/s/$slug/register': typeof SSlugRegisterRoute
   '/admin/': typeof AuthenticatedAdminIndexRoute
+  '/api/me/': typeof ApiMeIndexRoute
   '/s/$slug/': typeof SSlugIndexRoute
 }
 export interface FileRoutesByTo {
@@ -224,6 +231,7 @@ export interface FileRoutesByTo {
   '/s/$slug/login': typeof SSlugLoginRoute
   '/s/$slug/register': typeof SSlugRegisterRoute
   '/admin': typeof AuthenticatedAdminIndexRoute
+  '/api/me': typeof ApiMeIndexRoute
   '/s/$slug': typeof SSlugIndexRoute
 }
 export interface FileRoutesById {
@@ -253,6 +261,7 @@ export interface FileRoutesById {
   '/s/$slug/login': typeof SSlugLoginRoute
   '/s/$slug/register': typeof SSlugRegisterRoute
   '/_authenticated/admin/': typeof AuthenticatedAdminIndexRoute
+  '/api/me/': typeof ApiMeIndexRoute
   '/s/$slug/': typeof SSlugIndexRoute
 }
 export interface FileRouteTypes {
@@ -282,6 +291,7 @@ export interface FileRouteTypes {
     | '/s/$slug/login'
     | '/s/$slug/register'
     | '/admin/'
+    | '/api/me/'
     | '/s/$slug/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -307,6 +317,7 @@ export interface FileRouteTypes {
     | '/s/$slug/login'
     | '/s/$slug/register'
     | '/admin'
+    | '/api/me'
     | '/s/$slug'
   id:
     | '__root__'
@@ -335,6 +346,7 @@ export interface FileRouteTypes {
     | '/s/$slug/login'
     | '/s/$slug/register'
     | '/_authenticated/admin/'
+    | '/api/me/'
     | '/s/$slug/'
   fileRoutesById: FileRoutesById
 }
@@ -346,6 +358,7 @@ export interface RootRouteChildren {
   ResetPasswordRoute: typeof ResetPasswordRoute
   SSlugRouteRoute: typeof SSlugRouteRouteWithChildren
   ApiPublicSmsWebhookRoute: typeof ApiPublicSmsWebhookRoute
+  ApiMeIndexRoute: typeof ApiMeIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -447,6 +460,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/s/$slug/'
       preLoaderRoute: typeof SSlugIndexRouteImport
       parentRoute: typeof SSlugRouteRoute
+    }
+    '/api/me/': {
+      id: '/api/me/'
+      path: '/api/me'
+      fullPath: '/api/me/'
+      preLoaderRoute: typeof ApiMeIndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/_authenticated/admin/': {
       id: '/_authenticated/admin/'
@@ -612,6 +632,7 @@ const rootRouteChildren: RootRouteChildren = {
   ResetPasswordRoute: ResetPasswordRoute,
   SSlugRouteRoute: SSlugRouteRouteWithChildren,
   ApiPublicSmsWebhookRoute: ApiPublicSmsWebhookRoute,
+  ApiMeIndexRoute: ApiMeIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

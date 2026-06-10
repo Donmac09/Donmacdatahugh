@@ -2,7 +2,7 @@ import { Link, useRouterState, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { getMe, placeOrders } from "@/lib/api/donmac.functions";
+import { placeOrders } from "@/lib/api/donmac.functions";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { MAIN_BRAND } from "@/lib/brand";
@@ -16,21 +16,63 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
 
 export function useMe() {
-  const fn = useServerFn(getMe);
-  return useQuery({ queryKey: ["me"], queryFn: () => fn() });
+  return useQuery({ 
+    queryKey: ["me"], 
+    queryFn: async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) return null;
+        
+        const [{ data: profile, error: profileError }, { data: roles, error: rolesError }, { data: reseller, error: resellerError }] = await Promise.all([
+          supabase.from("profiles").select("*").eq("id", session.user.id).single(),
+          supabase.from("user_roles").select("role").eq("user_id", session.user.id),
+          supabase.from("resellers").select("id, store_name, slug, whatsapp, welcome_message").eq("user_id", session.user.id).maybeSingle(),
+        ]);
+        
+        if (profileError) throw profileError;
+        if (rolesError) throw rolesError;
+        if (resellerError) throw resellerError;
+        
+        const roleNames = (roles ?? [])
+          .map((item) => String(item.role ?? "").trim().toLowerCase())
+          .filter(Boolean);
+        const hasAdmin = roleNames.includes("admin");
+        const hasReseller = roleNames.includes("reseller");
+
+        return {
+          profile,
+          role: hasAdmin ? "admin" : hasReseller ? "reseller" : roleNames[0] ?? "customer",
+          roles: roleNames,
+          reseller: reseller ? {
+            id: reseller.id,
+            store_name: reseller.store_name,
+            store_slug: reseller.slug,
+            whatsapp: reseller.whatsapp,
+            welcome_message: reseller.welcome_message,
+          } : null
+        };
+      } catch (e) {
+        console.error("useMe error:", e);
+        return null;
+      }
+    },
+    staleTime: 5 * 60 * 1000,
+  });
 }
 
 export function AppShell({ children, brand }: { children: ReactNode; brand?: { name: string; whatsapp: string } }) {
-  const { data: me } = useMe();
+  const { data: me, refetch } = useMe();
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const [open, setOpen] = useState(false);
   const cart = useCart();
 
-  const isAdmin = me?.roles.includes("admin");
-  const isReseller = me?.roles.includes("reseller");
-  const linkedBrand = me?.linkedReseller
-    ? { name: me.linkedReseller.store_name, whatsapp: me.linkedReseller.whatsapp }
+  const userRole = me?.role || String(me?.profile?.role ?? "").trim().toLowerCase();
+  const isAdmin = me?.roles?.includes("admin") ?? userRole === "admin";
+  const isReseller = (me?.roles?.includes("reseller") ?? false) || userRole === "reseller" || isAdmin || !!me?.reseller;
+  
+  const linkedBrand = me?.reseller
+    ? { name: me.reseller.store_name, whatsapp: me.reseller.whatsapp }
     : null;
   const displayBrand = brand ?? linkedBrand ?? { name: MAIN_BRAND.name, whatsapp: MAIN_BRAND.whatsapp };
 
@@ -39,7 +81,7 @@ export function AppShell({ children, brand }: { children: ReactNode; brand?: { n
     { to: "/topups", label: "Top ups", icon: Wallet },
     { to: "/orders", label: "Orders", icon: Package },
     { to: "/transactions", label: "Transactions", icon: ArrowDownUp },
-    ...(isReseller ? [{ to: "/mystore", label: "My Store", icon: Store }] : []),
+    ...(isReseller || isAdmin ? [{ to: "/mystore", label: "My Store", icon: Store }] : []),
     { to: "/profile", label: "Profile", icon: User },
     ...(isAdmin ? [{ to: "/admin/analytics", label: "Admin", icon: ShieldCheck }] : []),
   ];
@@ -48,6 +90,11 @@ export function AppShell({ children, brand }: { children: ReactNode; brand?: { n
     await supabase.auth.signOut();
     navigate({ to: "/login" });
   }
+
+  // Refresh me data when component mounts
+  useEffect(() => {
+    refetch();
+  }, []);
 
   return (
     <div className="min-h-screen bg-background flex">

@@ -22,9 +22,10 @@ function StorefrontHome() {
 
   const dataPkgs = data.packages.filter((p) => p.type === "data");
   const minsPkgs = data.packages.filter((p) => p.type === "mins_data");
-  const dataOnline = data.networkStatus.find((s) => s.type === "data")?.online ?? true;
-  const minsOnline = data.networkStatus.find((s) => s.type === "mins_data")?.online ?? true;
-  const wa = data.reseller.whatsapp;
+  const status = data.networkStatus ?? [];
+  const dataOnline = status.find((s) => s.network === "mtn" && s.type === "data")?.online ?? true;
+  const minsOnline = status.find((s) => s.network === "mtn" && s.type === "mins_data")?.online ?? true;
+  const wa = data.reseller?.whatsapp ?? "";
 
   return (
     <div className="min-h-screen bg-background pb-28">

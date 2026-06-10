@@ -43,8 +43,10 @@ function LoginPage() {
       supabase.from("profiles").select("reseller_id").eq("id", uid).maybeSingle(),
       supabase.from("user_roles").select("role").eq("user_id", uid),
     ]);
-    const isCustomerOnly =
-      roles && roles.length > 0 && roles.every((r) => r.role === "customer");
+    const roleNames = (roles ?? [])
+      .map((item) => String(item.role ?? "").trim().toLowerCase())
+      .filter(Boolean);
+    const isCustomerOnly = roleNames.length > 0 && roleNames.every((r) => r === "customer");
     if (isCustomerOnly && profile?.reseller_id) {
       const { data: r } = await supabase.from("resellers").select("slug").eq("id", profile.reseller_id).maybeSingle();
       if (r?.slug) {

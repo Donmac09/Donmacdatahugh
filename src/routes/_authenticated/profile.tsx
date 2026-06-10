@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { AppShell, useMe } from "@/components/app-shell";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,11 @@ function ProfilePage() {
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
   const [show, setShow] = useState(false);
+
+  useEffect(() => {
+    setName(me?.profile?.full_name ?? "");
+    setPhone(me?.profile?.phone ?? "");
+  }, [me?.profile?.full_name, me?.profile?.phone]);
 
   const saveMut = useMutation({
     mutationFn: async () => {

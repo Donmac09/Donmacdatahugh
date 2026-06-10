@@ -1,599 +1,572 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { z } from "zod";
-import { genRefCode } from "@/lib/format";
 
-// === Profile helpers ===
+// Helper to get user from context
+function getUserFromContext(context: any) {
+  return context?.user?.id || context?.session?.user?.id;
+}
+
+// ============== AUTH & USER FUNCTIONS ==============
+
 export const getMe = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { supabase, userId } = context;
+    const userId = getUserFromContext(context);
+    if (!userId) return null;
+    
     const [{ data: profile }, { data: roles }, { data: reseller }] = await Promise.all([
-      supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
-      supabase.from("user_roles").select("role").eq("user_id", userId),
-      supabase.from("resellers").select("*").eq("user_id", userId).maybeSingle(),
+      supabaseAdmin.from("profiles").select("*").eq("id", userId).single(),
+      supabaseAdmin.from("user_roles").select("role").eq("user_id", userId),
+      supabaseAdmin.from("resellers").select("id, store_name, slug, whatsapp, welcome_message").eq("user_id", userId).maybeSingle(),
     ]);
+    
+    if (!profile) return null;
 
-    const { data: linkedReseller } = profile?.reseller_id
-      ? await supabase
-          .from("resellers")
-          .select("id, store_name, slug, welcome_message, whatsapp")
-          .eq("id", profile.reseller_id)
-          .maybeSingle()
-      : { data: null };
+    const roleNames = (roles ?? []).map((item) => item.role);
+    const hasAdmin = roleNames.includes("admin");
+    const hasReseller = roleNames.includes("reseller");
 
     return {
       profile,
-      roles: roles?.map((r) => r.role) ?? [],
-      reseller,
-      linkedReseller,
+      role: hasAdmin ? "admin" : hasReseller ? "reseller" : roleNames[0] ?? "customer",
+      roles: roleNames,
+      reseller: reseller ? {
+        id: reseller.id,
+        store_name: reseller.store_name,
+        store_slug: reseller.slug,
+        whatsapp: reseller.whatsapp,
+        welcome_message: reseller.welcome_message,
+      } : null
     };
   });
 
-// === Ref codes / topups ===
 export const createRefCode = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d?: { forceRegenerate?: boolean }) =>
-    z.object({ forceRegenerate: z.boolean().optional().default(false) }).parse(d ?? {}),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-
-    if (!data.forceRegenerate) {
-      const { data: existing } = await supabase
+  .validator(z.object({
+    forceRegenerate: z.boolean().optional()
+  }))
+  .handler(async ({ context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated - Please login");
+    
+    const generateCode = () => {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789';
+      let code = '';
+      for (let i = 0; i < 6; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return code;
+    };
+    
+    let code = generateCode();
+    let exists = true;
+    
+    while (exists) {
+      const { data: existing } = await supabaseAdmin
         .from("ref_codes")
         .select("code")
-        .eq("user_id", userId)
-        .eq("used", false)
-        .order("created_at", { ascending: false })
+        .eq("code", code)
         .maybeSingle();
-
-      if (existing?.code) return { code: existing.code };
+      exists = !!existing;
+      if (exists) code = generateCode();
     }
-
-    const { error: retireError } = await supabase
+    
+    await supabaseAdmin
       .from("ref_codes")
-      .update({ used: true })
-      .eq("user_id", userId)
-      .eq("used", false);
-
-    if (retireError) throw new Error(retireError.message);
-
-    for (let i = 0; i < 6; i++) {
-      const code = genRefCode();
-      const { error } = await supabase.from("ref_codes").insert({ code, user_id: userId });
-      if (!error) return { code };
-    }
-    throw new Error("Could not generate ref code, try again");
+      .upsert({ 
+        user_id: userId, 
+        code: code, 
+        used: false,
+        created_at: new Date().toISOString()
+      })
+      .eq("user_id", userId);
+    
+    return { code };
   });
 
 export const claimByTransactionId = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { transactionId: string; amount: number }) =>
-    z.object({ transactionId: z.string().min(4).max(64), amount: z.number().positive().max(100000) }).parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    // create a pending topup; admin will mark credited or webhook will match
-    const { error } = await supabase.from("topups").insert({
-      user_id: userId,
-      ref_code: "MANUAL",
-      transaction_id: data.transactionId,
-      amount: data.amount,
-      status: "pending",
-    });
-    if (error) throw new Error(error.message);
-    return { ok: true };
+  .validator(z.object({
+    transactionId: z.string(),
+    amount: z.number()
+  }))
+  .handler(async ({ data, context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated");
+    
+    await supabaseAdmin
+      .from("topups")
+      .insert({
+        user_id: userId,
+        transaction_id: data.transactionId,
+        amount: data.amount,
+        method: "MoMo",
+        status: "pending"
+      });
+    
+    return { success: true };
   });
 
+// ============== PACKAGE FUNCTIONS ==============
+
 export const getPackagesForUser = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const { supabase, userId } = context;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const [{ data: profile }, { data: roles }, { data: packages }, { data: networkStatus }] = await Promise.all([
-      supabase.from("profiles").select("reseller_id").eq("id", userId).maybeSingle(),
-      supabase.from("user_roles").select("role").eq("user_id", userId),
-      supabaseAdmin.from("packages").select("*").eq("enabled", true).order("type").order("sort_order"),
-      supabaseAdmin.from("network_status").select("*"),
+  .handler(async () => {
+    const [packages, status] = await Promise.all([
+      supabaseAdmin.from("packages").select("*").order("display_order"),
+      supabaseAdmin.from("network_status").select("*")
     ]);
-
-    const isReseller = roles?.some((r) => r.role === "reseller") ?? false;
-    const resellerId = profile?.reseller_id ?? null;
-    const ids = (packages ?? []).map((p) => p.id);
-
-    let priceMap = new Map<string, number>();
-    if (!isReseller && resellerId && ids.length) {
-      const { data: resellerPrices } = await supabaseAdmin
-        .from("reseller_prices")
-        .select("package_id, price")
-        .eq("reseller_id", resellerId)
-        .in("package_id", ids);
-
-      priceMap = new Map((resellerPrices ?? []).map((p) => [p.package_id, Number(p.price)]));
-    }
-
-    return {
-      packages: (packages ?? []).map((p) => ({
-        ...p,
-        display_price: priceMap.get(p.id) ?? Number(p.cost_price),
-      })),
-      status: networkStatus ?? [],
+    
+    return { 
+      packages: packages.data ?? [], 
+      status: status.data ?? [] 
     };
   });
 
-// === Orders / cart checkout ===
-export const placeOrders = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { items: Array<{ packageId: string; phone: string }> }) =>
-    z
-      .object({
-        items: z
-          .array(
-            z.object({
-              packageId: z.string().uuid(),
-              phone: z.string().min(7).max(20),
-            }),
-          )
-          .min(1)
-          .max(20),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-
-    const { data: profile } = await supabase.from("profiles").select("*").eq("id", userId).maybeSingle();
-    if (!profile) throw new Error("Profile not found");
-    if (profile.blocked) throw new Error("Your account is blocked");
-
-    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
-    const isReseller = roles?.some((r) => r.role === "reseller");
-
-    const ids = data.items.map((i) => i.packageId);
-    const { data: pkgs } = await supabaseAdmin.from("packages").select("*").in("id", ids);
-    if (!pkgs || pkgs.length === 0) throw new Error("No packages found");
-
-    // pricing: if reseller, charge their cost_price; if customer with reseller_id, charge reseller_prices; else cost_price
-    let prices: Record<string, number> = {};
-    if (isReseller || !profile.reseller_id) {
-      pkgs.forEach((p) => (prices[p.id] = Number(p.cost_price)));
-    } else {
-      const { data: rp } = await supabaseAdmin
-        .from("reseller_prices")
-        .select("package_id, price")
-        .eq("reseller_id", profile.reseller_id)
-        .in("package_id", ids);
-      const map = new Map((rp ?? []).map((r) => [r.package_id, Number(r.price)]));
-      pkgs.forEach((p) => (prices[p.id] = map.get(p.id) ?? Number(p.cost_price)));
-    }
-
-    const total = data.items.reduce((s, it) => s + (prices[it.packageId] ?? 0), 0);
-    const balance = Number(profile.balance ?? 0);
-    if (balance < total) throw new Error("Insufficient wallet balance");
-
-    // create orders (sequential refs DHM001…)
-    const rows: any[] = [];
-    for (const it of data.items) {
-      const p = pkgs.find((x) => x.id === it.packageId)!;
-      const { data: refRow } = await supabaseAdmin.rpc("next_order_ref");
-      rows.push({
-        ref: refRow as unknown as string,
-        user_id: userId,
-        reseller_id: profile.reseller_id,
-        package_id: it.packageId,
-        network: p.network,
-        phone: it.phone,
-        amount: prices[it.packageId],
-        cost_price: Number(p.cost_price),
-        status: "pending" as const,
-      });
-    }
-    const { data: inserted, error: oerr } = await supabaseAdmin.from("orders").insert(rows).select();
-    if (oerr) throw new Error(oerr.message);
-
-    // debit wallet & log transactions
-    const newBalance = balance - total;
-    const { error: uerr } = await supabaseAdmin
-      .from("profiles")
-      .update({ balance: newBalance })
-      .eq("id", userId);
-    if (uerr) throw new Error(uerr.message);
-
-    await supabaseAdmin.from("transactions").insert(
-      inserted!.map((o) => ({
-        user_id: userId,
-        type: "debit" as const,
-        description: `Order ${o.ref}`,
-        amount: o.amount,
-        status: "success" as const,
-      })),
-    );
-
-    return { ok: true, count: inserted!.length, total, balance: newBalance };
-  });
-
-// === Reseller storefront ===
-export const createMyStore = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { storeName: string; welcomeMessage: string; whatsapp: string }) =>
-    z
-      .object({
-        storeName: z.string().min(2).max(60),
-        welcomeMessage: z.string().max(280).optional().default(""),
-        whatsapp: z.string().min(7).max(20),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: roles } = await supabase.from("user_roles").select("role").eq("user_id", userId);
-    if (!roles?.some((r) => r.role === "reseller")) throw new Error("Only resellers can create a store");
-
-    const baseSlug = data.storeName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "")
-      .slice(0, 32) || "store";
-    let slug = baseSlug;
-    for (let i = 0; i < 20; i++) {
-      const { data: exists } = await supabaseAdmin.from("resellers").select("id").eq("slug", slug).maybeSingle();
-      if (!exists) break;
-      slug = `${baseSlug}-${Math.random().toString(36).slice(2, 5)}`;
-    }
-    const { data: row, error } = await supabase
-      .from("resellers")
-      .upsert(
-        {
-          user_id: userId,
-          store_name: data.storeName,
-          welcome_message: data.welcomeMessage,
-          whatsapp: data.whatsapp,
-          slug,
-        },
-        { onConflict: "user_id" },
-      )
-      .select()
-      .single();
-    if (error) throw new Error(error.message);
-    return row;
-  });
-
-export const updateMyPrices = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { prices: Array<{ packageId: string; price: number }> }) =>
-    z
-      .object({
-        prices: z
-          .array(z.object({ packageId: z.string().uuid(), price: z.number().min(0).max(100000) }))
-          .min(1)
-          .max(100),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    const { data: reseller } = await supabase.from("resellers").select("id").eq("user_id", userId).maybeSingle();
-    if (!reseller) throw new Error("Create your store first");
-    const rows = data.prices.map((p) => ({
-      reseller_id: reseller.id,
-      package_id: p.packageId,
-      price: p.price,
-    }));
-    const { error } = await supabase.from("reseller_prices").upsert(rows, { onConflict: "reseller_id,package_id" });
-    if (error) throw new Error(error.message);
-    return { ok: true };
-  });
-
-export const requestWithdrawal = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { amount: number }) => z.object({ amount: z.number().min(30).max(100000) }).parse(d))
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    const { data: reseller } = await supabase.from("resellers").select("id").eq("user_id", userId).maybeSingle();
-    if (!reseller) throw new Error("Create your store first");
-    const { error } = await supabase
-      .from("withdrawals")
-      .insert({ reseller_id: reseller.id, user_id: userId, amount: data.amount, status: "pending" });
-    if (error) throw new Error(error.message);
-    return { ok: true };
-  });
-
-// === Admin ===
-async function requireAdmin(supabase: any, userId: string) {
-  const { data } = await supabase.from("user_roles").select("role").eq("user_id", userId).eq("role", "admin").maybeSingle();
-  if (!data) throw new Error("Admin only");
-}
-
-export const adminAdjustBalance = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { userId: string; delta: number; note: string }) =>
-    z.object({ userId: z.string().uuid(), delta: z.number(), note: z.string().min(1).max(200) }).parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: p } = await supabaseAdmin.from("profiles").select("balance").eq("id", data.userId).maybeSingle();
-    if (!p) throw new Error("User not found");
-    const newBal = Number(p.balance) + data.delta;
-    if (newBal < 0) throw new Error("Insufficient balance");
-    await supabaseAdmin.from("profiles").update({ balance: newBal }).eq("id", data.userId);
-    await supabaseAdmin.from("transactions").insert({
-      user_id: data.userId,
-      type: data.delta >= 0 ? "credit" : "debit",
-      amount: Math.abs(data.delta),
-      description: `Admin ${data.delta >= 0 ? "credit" : "debit"}: ${data.note}`,
-      status: "success",
-    });
-    return { ok: true, balance: newBal };
-  });
-
-export const adminSetBlocked = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { userId: string; blocked: boolean }) =>
-    z.object({ userId: z.string().uuid(), blocked: z.boolean() }).parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.from("profiles").update({ blocked: data.blocked }).eq("id", data.userId);
-    return { ok: true };
-  });
-
-export const adminDeleteUser = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { userId: string }) => z.object({ userId: z.string().uuid() }).parse(d))
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.auth.admin.deleteUser(data.userId);
-    return { ok: true };
-  });
-
-export const adminUpdateOrderStatus = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { orderId: string; status: "pending" | "processing" | "delivered" | "failed" }) =>
-    z
-      .object({
-        orderId: z.string().uuid(),
-        status: z.enum(["pending", "processing", "delivered", "failed"]),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: order } = await supabaseAdmin.from("orders").select("*").eq("id", data.orderId).maybeSingle();
-    if (!order) throw new Error("Order not found");
-    await supabaseAdmin.from("orders").update({ status: data.status }).eq("id", data.orderId);
-    // refund on failed
-    if (data.status === "failed" && order.status !== "failed") {
-      const { data: p } = await supabaseAdmin.from("profiles").select("balance").eq("id", order.user_id).maybeSingle();
-      if (p) {
-        await supabaseAdmin
-          .from("profiles")
-          .update({ balance: Number(p.balance) + Number(order.amount) })
-          .eq("id", order.user_id);
-        await supabaseAdmin.from("transactions").insert({
-          user_id: order.user_id,
-          type: "credit",
-          amount: order.amount,
-          description: `Refund for failed order ${order.ref}`,
-          status: "success",
-        });
-      }
-    }
-    return { ok: true };
-  });
-
-export const adminCreateReseller = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { email: string; phone: string; password: string; fullName: string }) =>
-    z
-      .object({
-        email: z.string().email(),
-        phone: z.string().min(7).max(20),
-        password: z.string().min(8).max(72),
-        fullName: z.string().min(2).max(80),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: u, error } = await supabaseAdmin.auth.admin.createUser({
-      email: data.email,
-      password: data.password,
-      email_confirm: true,
-      user_metadata: { full_name: data.fullName, phone: data.phone, role: "reseller" },
-    });
-    if (error) throw new Error(error.message);
-    return { ok: true, userId: u.user?.id };
-  });
-
 export const adminTogglePackage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { packageId: string; enabled: boolean }) =>
-    z.object({ packageId: z.string().uuid(), enabled: z.boolean() }).parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.from("packages").update({ enabled: data.enabled }).eq("id", data.packageId);
-    return { ok: true };
+  .validator(z.object({
+    packageId: z.string(),
+    enabled: z.boolean()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("packages")
+      .update({ enabled: data.enabled })
+      .eq("id", data.packageId);
+    return { success: true };
   });
 
 export const adminToggleNetwork = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { type: "data" | "mins_data"; online: boolean }) =>
-    z.object({ type: z.enum(["data", "mins_data"]), online: z.boolean() }).parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  .validator(z.object({
+    network: z.string(),
+    type: z.string(),
+    online: z.boolean()
+  }))
+  .handler(async ({ data }) => {
     await supabaseAdmin
       .from("network_status")
-      .update({ online: data.online })
-      .eq("network", "mtn")
-      .eq("type", data.type);
-    return { ok: true };
+      .upsert(
+        { network: data.network, type: data.type, online: data.online },
+        { onConflict: ["network", "type"] }
+      );
+    return { success: true };
   });
 
-export const adminUpdateSettings = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { autoDeliverEnabled: boolean; autoDeliverMinutes: number }) =>
-    z
-      .object({
-        autoDeliverEnabled: z.boolean(),
-        autoDeliverMinutes: z.number().int().min(1).max(60),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin
-      .from("app_settings")
-      .update({ auto_deliver_enabled: data.autoDeliverEnabled, auto_deliver_minutes: data.autoDeliverMinutes })
-      .eq("id", 1);
-    return { ok: true };
-  });
+// ============== ORDER FUNCTIONS ==============
 
-export const adminUpdateWithdrawal = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { id: string; status: "accepted" | "rejected" | "paid"; note?: string }) =>
-    z
-      .object({
-        id: z.string().uuid(),
-        status: z.enum(["accepted", "rejected", "paid"]),
-        note: z.string().max(200).optional(),
-      })
-      .parse(d),
-  )
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: w } = await supabaseAdmin.from("withdrawals").select("*").eq("id", data.id).maybeSingle();
-    if (!w) throw new Error("Withdrawal not found");
-    await supabaseAdmin
-      .from("withdrawals")
-      .update({ status: data.status, note: data.note ?? null })
-      .eq("id", data.id);
-    if (data.status === "paid") {
-      // record a debit transaction (balance already represents earnings withheld by admin externally)
-      await supabaseAdmin.from("transactions").insert({
-        user_id: w.user_id,
-        type: "debit",
-        amount: w.amount,
-        description: `Withdrawal paid`,
-        status: "success",
+export const placeOrders = createServerFn({ method: "POST" })
+  .validator(z.object({
+    items: z.array(z.object({
+      packageId: z.number(),
+      phone: z.string()
+    }))
+  }))
+  .handler(async ({ data, context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated");
+    
+    const { data: profile } = await supabaseAdmin
+      .from("profiles")
+      .select("balance")
+      .eq("id", userId)
+      .single();
+    
+    let totalAmount = 0;
+    const orderItems = [];
+    
+    for (const item of data.items) {
+      const { data: pkg } = await supabaseAdmin
+        .from("packages")
+        .select("name, cost_price")
+        .eq("id", item.packageId)
+        .single();
+      
+      totalAmount += pkg.cost_price;
+      orderItems.push({
+        package_id: item.packageId,
+        package_name: pkg.name,
+        phone_number: item.phone,
+        amount: pkg.cost_price,
+        cost_price: pkg.cost_price
       });
     }
-    return { ok: true };
+    
+    if (profile.balance < totalAmount) {
+      throw new Error(`Insufficient balance. Need ₵${totalAmount}, have ₵${profile.balance}`);
+    }
+    
+    for (const item of orderItems) {
+      await supabaseAdmin.from("orders").insert({
+        user_id: userId,
+        package_id: item.package_id,
+        package_name: item.package_name,
+        phone_number: item.phone_number,
+        amount: item.amount,
+        cost_price: item.cost_price,
+        status: "pending"
+      });
+    }
+    
+    const newBalance = profile.balance - totalAmount;
+    await supabaseAdmin.from("profiles").update({ balance: newBalance }).eq("id", userId);
+    
+    await supabaseAdmin.from("transactions").insert({
+      user_id: userId,
+      type: "debit",
+      amount: totalAmount,
+      description: `Order placed for ${orderItems.length} item(s)`,
+      status: "completed"
+    });
+    
+    return { count: orderItems.length, total: totalAmount };
+  });
+
+export const adminUpdateOrderStatus = createServerFn({ method: "POST" })
+  .validator(z.object({
+    orderId: z.number(),
+    status: z.enum(['pending', 'processing', 'delivered', 'failed'])
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("orders")
+      .update({ status: data.status, updated_at: new Date().toISOString() })
+      .eq("id", data.orderId);
+    return { success: true };
   });
 
 export const adminDeleteOrder = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { orderId: string }) => z.object({ orderId: z.string().uuid() }).parse(d))
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("orders").delete().eq("id", data.orderId);
-    if (error) throw new Error(error.message);
-    return { ok: true };
+  .validator(z.object({
+    orderId: z.number()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("orders")
+      .delete()
+      .eq("id", data.orderId);
+    return { success: true };
+  });
+
+export const adminListOrders = createServerFn({ method: "GET" })
+  .handler(async () => {
+    const { data: orders } = await supabaseAdmin
+      .from("orders")
+      .select("*, profiles:user_id(email, phone)")
+      .order("created_at", { ascending: false });
+    return orders || [];
+  });
+
+// ============== USER MANAGEMENT FUNCTIONS ==============
+
+export const adminGetUsers = createServerFn({ method: "GET" })
+  .handler(async () => {
+    const { data: users } = await supabaseAdmin
+      .from("profiles")
+      .select("*")
+      .order("created_at", { ascending: false });
+    return users || [];
+  });
+
+export const adminAdjustBalance = createServerFn({ method: "POST" })
+  .validator(z.object({
+    userId: z.string(),
+    delta: z.number(),
+    note: z.string().optional()
+  }))
+  .handler(async ({ data }) => {
+    const { data: profile } = await supabaseAdmin
+      .from("profiles")
+      .select("balance")
+      .eq("id", data.userId)
+      .single();
+    
+    const isCredit = data.delta >= 0;
+    const amount = Math.abs(data.delta);
+    const type = isCredit ? 'credit' : 'debit';
+    const description = data.note || (isCredit ? 'credit' : 'debit');
+    
+    const newBalance = isCredit
+      ? (profile.balance || 0) + amount
+      : (profile.balance || 0) - amount;
+    
+    await supabaseAdmin
+      .from("profiles")
+      .update({ balance: newBalance })
+      .eq("id", data.userId);
+    
+    await supabaseAdmin
+      .from("transactions")
+      .insert({
+        user_id: data.userId,
+        type,
+        amount,
+        description,
+        status: "completed"
+      });
+    
+    return { success: true, newBalance };
+  });
+
+export const adminBlockUser = createServerFn({ method: "POST" })
+  .validator(z.object({
+    userId: z.string(),
+    block: z.boolean()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("profiles")
+      .update({ is_blocked: data.block })
+      .eq("id", data.userId);
+    return { success: true };
+  });
+
+export const adminSetBlocked = createServerFn({ method: "POST" })
+  .validator(z.object({
+    userId: z.string(),
+    blocked: z.boolean()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("profiles")
+      .update({ is_blocked: data.blocked })
+      .eq("id", data.userId);
+    return { success: true };
+  });
+
+export const adminDeleteUser = createServerFn({ method: "POST" })
+  .validator(z.object({
+    userId: z.string()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin.from("profiles").delete().eq("id", data.userId);
+    return { success: true };
+  });
+
+export const adminCreateReseller = createServerFn({ method: "POST" })
+  .validator(z.object({
+    email: z.string().email(),
+    phone: z.string(),
+    fullName: z.string().optional(),
+    password: z.string().min(6)
+  }))
+  .handler(async ({ data }) => {
+    const slug = data.email.split('@')[0].toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const storeName = (data.fullName || data.email.split('@')[0]) + "'s Store";
+    
+    const { data: existing } = await supabaseAdmin
+      .from("profiles")
+      .select("id")
+      .eq("email", data.email)
+      .maybeSingle();
+    
+    if (existing) {
+      throw new Error("User with this email already exists");
+    }
+    
+    const { data: user, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: data.email,
+      password: data.password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: data.fullName || data.email.split('@')[0],
+        phone: data.phone,
+        role: "reseller"
+      }
+    });
+
+    if (authError || !user) {
+      throw new Error(authError?.message || "Unable to create reseller account");
+    }
+
+    await supabaseAdmin.from("resellers").insert({
+      user_id: user.id,
+      store_name: storeName,
+      slug,
+      whatsapp: data.phone
+    });
+
+    await supabaseAdmin
+      .from("profiles")
+      .update({
+        store_name: storeName,
+        store_slug: slug,
+        store_whatsapp: data.phone
+      })
+      .eq("id", user.id);
+    
+    return { success: true };
+  });
+
+// ============== WITHDRAWAL FUNCTIONS ==============
+
+export const requestWithdrawal = createServerFn({ method: "POST" })
+  .validator(z.object({
+    amount: z.number()
+  }))
+  .handler(async ({ data, context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated");
+    if (data.amount < 30) throw new Error("Minimum withdrawal amount is ₵30");
+    
+    await supabaseAdmin.from("withdrawals").insert({
+      reseller_id: userId,
+      amount: data.amount,
+      status: "pending"
+    });
+    
+    return { success: true };
+  });
+
+export const adminGetWithdrawals = createServerFn({ method: "GET" })
+  .handler(async () => {
+    const { data: withdrawals } = await supabaseAdmin
+      .from("withdrawals")
+      .select("*, profiles:reseller_id(email, store_name)")
+      .order("created_at", { ascending: false });
+    return withdrawals || [];
+  });
+
+export const adminUpdateWithdrawal = createServerFn({ method: "POST" })
+  .validator(z.object({
+    withdrawalId: z.number(),
+    status: z.enum(['pending', 'approved', 'rejected', 'paid'])
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("withdrawals")
+      .update({ status: data.status, processed_at: new Date().toISOString() })
+      .eq("id", data.withdrawalId);
+    return { success: true };
+  });
+
+// ============== STORE FUNCTIONS ==============
+
+export const createMyStore = createServerFn({ method: "POST" })
+  .validator(z.object({
+    storeName: z.string(),
+    welcomeMessage: z.string(),
+    whatsapp: z.string()
+  }))
+  .handler(async ({ data, context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated");
+    
+    const slug = data.storeName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    
+    await supabaseAdmin
+      .from("profiles")
+      .update({
+        store_name: data.storeName,
+        store_slug: slug,
+        store_welcome_message: data.welcomeMessage,
+        store_whatsapp: data.whatsapp,
+        role: "reseller"
+      })
+      .eq("id", userId);
+    
+    return { slug };
+  });
+
+export const updateMyPrices = createServerFn({ method: "POST" })
+  .validator(z.object({
+    prices: z.array(z.object({
+      packageId: z.string(),
+      price: z.number()
+    }))
+  }))
+  .handler(async ({ data, context }) => {
+    const userId = getUserFromContext(context);
+    if (!userId) throw new Error("Not authenticated");
+    
+    for (const price of data.prices) {
+      await supabaseAdmin
+        .from("reseller_prices")
+        .upsert({
+          reseller_id: userId,
+          package_id: parseInt(price.packageId),
+          price: price.price
+        });
+    }
+    
+    return { success: true };
+  });
+
+export const getStorefront = createServerFn({ method: "GET" })
+  .validator(z.object({
+    slug: z.string()
+  }))
+  .handler(async ({ data }) => {
+    const { data: store } = await supabaseAdmin
+      .from("profiles")
+      .select("id, store_name, store_welcome_message, store_whatsapp, email, phone")
+      .eq("store_slug", data.slug)
+      .single();
+    
+    if (!store) throw new Error("Store not found");
+    
+    const [{ data: packages }, { data: prices }, { data: networkStatus }] = await Promise.all([
+      supabaseAdmin.from("packages").select("*").eq("enabled", true).order("display_order"),
+      supabaseAdmin.from("reseller_prices").select("package_id, price").eq("reseller_id", store.id),
+      supabaseAdmin.from("network_status").select("*")
+    ]);
+    
+    const priceMap = new Map(prices?.map(p => [p.package_id, p.price]) || []);
+    
+    const packagesWithPrices = packages?.map(pkg => ({
+      ...pkg,
+      price: priceMap.get(pkg.id) || pkg.cost_price
+    })) || [];
+    
+    return {
+      reseller: {
+        id: store.id,
+        store_name: store.store_name,
+        welcome_message: store.store_welcome_message,
+        whatsapp: store.store_whatsapp,
+        email: store.email,
+        phone: store.phone,
+        store_slug: data.slug
+      },
+      packages: packagesWithPrices,
+      networkStatus: networkStatus ?? []
+    };
+  });
+
+// ============== TOPUP FUNCTIONS ==============
+
+export const adminListTopups = createServerFn({ method: "GET" })
+  .handler(async () => {
+    const { data: topups } = await supabaseAdmin
+      .from("topups")
+      .select("*, profiles:user_id(email)")
+      .order("created_at", { ascending: false });
+    return topups || [];
   });
 
 export const adminDeleteTopup = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
-  .inputValidator((d: { topupId: string }) => z.object({ topupId: z.string().uuid() }).parse(d))
-  .handler(async ({ context, data }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin.from("topups").delete().eq("id", data.topupId);
-    if (error) throw new Error(error.message);
-    return { ok: true };
-  });
-
-// Admin: list verified (credited) top-ups with user profile
-export const adminListTopups = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: topups } = await supabaseAdmin
-      .from("topups")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(500);
-    const ids = Array.from(new Set((topups ?? []).map((t) => t.user_id)));
-    const { data: profiles } = ids.length
-      ? await supabaseAdmin.from("profiles").select("id, email, full_name, phone").in("id", ids)
-      : { data: [] as any[] };
-    const pmap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
-    return (topups ?? []).map((t: any) => ({
-      ...t,
-      network: "mtn",
-      profile: pmap.get(t.user_id) ?? null,
-    }));
-  });
-
-// Admin: list orders with user profile (todays date filter applied client-side)
-export const adminListOrders = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
-  .handler(async ({ context }) => {
-    const { supabase, userId } = context;
-    await requireAdmin(supabase, userId);
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: orders } = await supabaseAdmin
-      .from("orders")
-      .select("*, packages(label)")
-      .order("created_at", { ascending: false })
-      .limit(1000);
-    const ids = Array.from(new Set((orders ?? []).map((o: any) => o.user_id)));
-    const { data: profiles } = ids.length
-      ? await supabaseAdmin.from("profiles").select("id, email, full_name, phone").in("id", ids)
-      : { data: [] as any[] };
-    const pmap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
-    return (orders ?? []).map((o: any) => ({
-      ...o,
-      profit: Number(o.amount) - Number(o.cost_price),
-      profile: pmap.get(o.user_id) ?? null,
-    }));
-  });
-
-
-// === Public storefront lookup ===
-export const getStorefront = createServerFn({ method: "GET" })
-  .inputValidator((d: { slug: string }) => z.object({ slug: z.string().min(1).max(64) }).parse(d))
+  .validator(z.object({
+    topupId: z.string()
+  }))
   .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: reseller } = await supabaseAdmin
-      .from("resellers")
-      .select("id, store_name, slug, welcome_message, whatsapp")
-      .eq("slug", data.slug)
-      .maybeSingle();
-    if (!reseller) return null;
-    const [{ data: pkgs }, { data: prices }, { data: ns }] = await Promise.all([
-      supabaseAdmin.from("packages").select("*").eq("enabled", true).order("type").order("sort_order"),
-      supabaseAdmin.from("reseller_prices").select("package_id, price").eq("reseller_id", reseller.id),
-      supabaseAdmin.from("network_status").select("*"),
-    ]);
-    const priceMap = new Map((prices ?? []).map((p) => [p.package_id, Number(p.price)]));
-    const withPrices = (pkgs ?? []).map((p) => ({ ...p, price: priceMap.get(p.id) ?? Number(p.cost_price) }));
-    return { reseller, packages: withPrices, networkStatus: ns ?? [] };
+    await supabaseAdmin
+      .from("topups")
+      .delete()
+      .eq("id", data.topupId);
+    return { success: true };
+  });
+
+// ============== SETTINGS FUNCTIONS ==============
+
+export const adminUpdateSettings = createServerFn({ method: "POST" })
+  .validator(z.object({
+    key: z.string(),
+    value: z.boolean()
+  }))
+  .handler(async ({ data }) => {
+    await supabaseAdmin
+      .from("system_settings")
+      .upsert({ key: data.key, value: data.value, updated_at: new Date().toISOString() });
+    return { success: true };
+  });
+
+export const getSystemSettings = createServerFn({ method: "GET" })
+  .handler(async () => {
+    const { data: settings } = await supabaseAdmin.from("system_settings").select("*");
+    return settings || [];
   });
