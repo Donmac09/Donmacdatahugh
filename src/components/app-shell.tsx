@@ -68,8 +68,8 @@ export function AppShell({ children, brand }: { children: ReactNode; brand?: { n
   const cart = useCart();
 
   const userRole = me?.role || String(me?.profile?.role ?? "").trim().toLowerCase();
-  const isAdmin = me?.roles?.includes("admin") ?? userRole === "admin";
-  const isReseller = (me?.roles?.includes("reseller") ?? false) || userRole === "reseller" || isAdmin || !!me?.reseller;
+  const isAdmin = me?.role === "admin" || (me?.roles?.includes("admin") ?? false) || userRole === "admin";
+  const isReseller = me?.role === "reseller" || (me?.roles?.includes("reseller") ?? false) || isAdmin || !!me?.reseller;
   
   const linkedBrand = me?.reseller
     ? { name: me.reseller.store_name, whatsapp: me.reseller.whatsapp }
@@ -81,7 +81,7 @@ export function AppShell({ children, brand }: { children: ReactNode; brand?: { n
     { to: "/topups", label: "Top ups", icon: Wallet },
     { to: "/orders", label: "Orders", icon: Package },
     { to: "/transactions", label: "Transactions", icon: ArrowDownUp },
-    ...(isReseller || isAdmin ? [{ to: "/mystore", label: "My Store", icon: Store }] : []),
+    ...(isReseller ? [{ to: "/mystore", label: "My Store", icon: Store }] : []),
     { to: "/profile", label: "Profile", icon: User },
     ...(isAdmin ? [{ to: "/admin/analytics", label: "Admin", icon: ShieldCheck }] : []),
   ];
